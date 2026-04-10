@@ -174,6 +174,24 @@ console.log("    \u2713 provider \"claude-proxy\" registered (sonnet / opus / ha
 if (setModelNote) console.log("    \u2713 " + setModelNote);
 ' || fail "failed to update $CONFIG_PATH"
 
+# ─── Also apply opencode-claude-bridge subscription-billing patches ──────────
+# If the user has opencode-claude-bridge installed (for Anthropic subscription
+# billing via OAuth), the published version sends a dynamic `cch` hash and the
+# SDK-mode system prompt, which routes every request into Anthropic's
+# "extra usage" pool. We patch it so it matches what the real `claude` CLI
+# sends (cch=00000, cli prompt, cc_entrypoint=cli). Safe no-op if bridge is
+# not installed.
+if [ -d "$HOME/.cache/opencode/node_modules/opencode-claude-bridge" ] || \
+   compgen -G "$HOME/.cache/opencode/packages/opencode-claude-bridge*/node_modules/opencode-claude-bridge" >/dev/null 2>&1; then
+  step "Applying opencode-claude-bridge subscription-billing patches"
+  if curl -fsSL https://raw.githubusercontent.com/iamtheavoc1/opencode-claude-proxy/main/patch-bridge.sh | bash; then
+    ok "bridge patched"
+  else
+    warn "bridge patch step failed (non-fatal) — run it manually:"
+    note "curl -fsSL https://raw.githubusercontent.com/iamtheavoc1/opencode-claude-proxy/main/patch-bridge.sh | bash"
+  fi
+fi
+
 # ─── Done ────────────────────────────────────────────────────────────────────
 step "Done"
 cat <<EOF
