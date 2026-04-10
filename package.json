@@ -1,0 +1,36 @@
+{
+  "name": "opencode-claude-proxy",
+  "version": "0.1.0",
+  "description": "Local OpenCode provider that proxies LLM calls through the Claude CLI binary so Anthropic models bill against your Claude subscription.",
+  "keywords": [
+    "opencode",
+    "claude",
+    "claude-code",
+    "ai-sdk",
+    "anthropic",
+    "provider"
+  ],
+  "license": "MIT",
+  "author": "Goncalo <goncalo@dealmeida.digital>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/iamtheavoc1/opencode-claude-proxy.git"
+  },
+  "bugs": {
+    "url": "https://github.com/iamtheavoc1/opencode-claude-proxy/issues"
+  },
+  "homepage": "https://github.com/iamtheavoc1/opencode-claude-proxy#readme",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "bun": ">=1.0.0"
+  }
+}
