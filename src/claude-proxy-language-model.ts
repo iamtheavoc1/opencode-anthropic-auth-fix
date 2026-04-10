@@ -18,7 +18,7 @@ import { EventEmitter } from "node:events"
 
 import { log } from "./logger.ts"
 import { mapTool } from "./tool-mapping.ts"
-import { buildClaudeUserMessage, extractSystemPrompt } from "./message-builder.ts"
+import { buildClaudeUserMessage } from "./message-builder.ts"
 import {
   deleteActiveProcess,
   deleteClaudeSessionId,
@@ -48,7 +48,6 @@ export interface ClaudeProxyConfig {
 
 interface SpawnOptions {
   sk: string
-  systemPrompt: string | undefined
   resumeSessionId: string | undefined
 }
 
@@ -75,6 +74,13 @@ export class ClaudeProxyLanguageModel {
   // ── Process management ───────────────────────────────────────────────
 
   private buildCliArgs(opts: SpawnOptions): string[] {
+    // IMPORTANT: do NOT pass --system-prompt. Overriding the default Claude
+    // Code system prompt makes Anthropic classify the request as API-style
+    // usage and meter it against the "extra usage" pool instead of the
+    // Claude Code subscription pool, causing "out of extra usage" 400s even
+    // when the subscription has plenty of interactive headroom. OpenCode's
+    // agent-specific system prompt is instead inlined at the top of the
+    // user turn in message-builder.ts so the CLI still bills as Claude Code.
     const args = [
       "--output-format",
       "stream-json",
@@ -85,7 +91,6 @@ export class ClaudeProxyLanguageModel {
       this.modelId,
     ]
     if (opts.resumeSessionId) args.push("--session-id", opts.resumeSessionId)
-    if (opts.systemPrompt) args.push("--system-prompt", opts.systemPrompt)
     if (this.config.skipPermissions) args.push("--dangerously-skip-permissions")
     return args
   }
@@ -159,8 +164,14 @@ export class ClaudeProxyLanguageModel {
       deleteActiveProcess(sk)
     }
 
-    const systemPrompt = extractSystemPrompt(options.prompt)
-    const userMsg = buildClaudeUserMessage(options.prompt)
+    // Inline the system prompt into the user turn only when we're about to
+    // spawn a fresh subprocess (no cached active process for this key). If
+    // we're reusing an existing subprocess, its earlier turn already carried
+    // the prefix and re-sending it would waste tokens.
+    const willSpawn = !getActiveProcess(sk)
+    const userMsg = buildClaudeUserMessage(options.prompt, {
+      includeSystemPrefix: willSpawn,
+    })
 
     const stream = new ReadableStream({
       start(controller) {
@@ -169,7 +180,6 @@ export class ClaudeProxyLanguageModel {
           try {
             ap = self.spawnProcess({
               sk,
-              systemPrompt,
               resumeSessionId: getClaudeSessionId(sk),
             })
           } catch (err) {
