@@ -26,31 +26,66 @@ This rewrite fixes both at the source:
 
 ## Requirements
 
-- [Claude CLI](https://docs.claude.com/en/docs/claude-code/overview) installed and authenticated (`claude auth login`).
-- [OpenCode](https://opencode.ai) running under Bun (it imports `.ts` files directly — no build step needed).
-- An active Claude Pro or Claude Max subscription (or Anthropic API key — the CLI accepts either).
+Everything the plugin needs at runtime. The installer checks every item below
+and bails out with a clear message if something's missing.
+
+| Tool                                                                           | Why                                                                 | Install                                                                                                              |
+| ------------------------------------------------------------------------------ | ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| [**Claude CLI**](https://docs.claude.com/en/docs/claude-code/overview)         | This plugin spawns `claude` as a subprocess per model turn.         | Download from the Claude Code docs, then run `claude login` to authenticate against your Claude Pro/Max subscription. |
+| **Claude subscription** (Pro or Max) **or** an `ANTHROPIC_API_KEY`             | The CLI uses whichever credential it can find; we don't touch auth. | Subscription: [claude.ai/upgrade](https://claude.ai/upgrade). API key: [console.anthropic.com](https://console.anthropic.com/settings/keys). |
+| [**OpenCode**](https://opencode.ai)                                            | This is a provider for OpenCode — no point in installing it alone.  | Follow the install instructions at [opencode.ai](https://opencode.ai).                                               |
+| [**Bun**](https://bun.sh) ≥ 1.0                                                | OpenCode runs on Bun; Bun also imports the plugin's `.ts` directly so there's no build step. | `curl -fsSL https://bun.sh/install \| bash`                                                                         |
+| **git**                                                                        | Used by the installer to clone / update the plugin.                 | Included with Xcode Command Line Tools on macOS, `apt install git` / `brew install git` elsewhere.                   |
+
+That's it. The plugin itself has **zero runtime dependencies** — just stdlib
+`child_process`, `readline`, and `events`. No `npm install`, no build, no
+compile step.
 
 ## Install
 
-Clone into any directory you'll keep long-term — the path will end up in
-`opencode.json`.
+### One-command install (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/iamtheavoc1/opencode-claude-proxy/main/install.sh | bash
+```
+
+That's it — this will:
+
+1. Check every requirement above and fail loudly if something's missing.
+2. Clone (or update) the plugin into `~/.local/share/opencode-claude-proxy`.
+3. Sanity-load it once to confirm OpenCode will accept it.
+4. Back up `~/.config/opencode/opencode.json` (if present) and merge the
+   `claude-proxy` provider entry into it. Existing providers, keys, agents,
+   and settings are preserved.
+5. Print the path and the next step.
+
+Re-run the same command any time to update to the latest `main`.
+
+Optional environment overrides:
+
+| Variable                                    | Default                                          | Purpose                                                                 |
+| ------------------------------------------- | ------------------------------------------------ | ----------------------------------------------------------------------- |
+| `OPENCODE_CLAUDE_PROXY_DIR`                 | `~/.local/share/opencode-claude-proxy`           | Where to clone the plugin.                                              |
+| `OPENCODE_CONFIG`                           | `~/.config/opencode/opencode.json`               | Which OpenCode config to patch.                                         |
+| `OPENCODE_CLAUDE_PROXY_REF`                 | `main`                                           | Branch, tag, or commit to install.                                      |
+| `OPENCODE_CLAUDE_PROXY_SET_DEFAULT_MODEL=1` | unset                                            | Also set `"model": "claude-proxy/sonnet"` if no default model is set.   |
+
+Example:
+
+```bash
+OPENCODE_CLAUDE_PROXY_SET_DEFAULT_MODEL=1 \
+  curl -fsSL https://raw.githubusercontent.com/iamtheavoc1/opencode-claude-proxy/main/install.sh | bash
+```
+
+### Manual install
+
+If you'd rather inspect things first or skip the installer's config merge:
 
 ```bash
 git clone https://github.com/iamtheavoc1/opencode-claude-proxy.git ~/opencode-claude-proxy
 ```
 
-Verify the `claude` binary is on your `PATH`:
-
-```bash
-claude --version
-```
-
-No build step, no `npm install` — the plugin has zero runtime dependencies
-beyond Node's built-in `child_process`, `readline`, and `events`.
-
-## Configure OpenCode
-
-Add the provider to your `opencode.json` (or your project-local
+Then add the provider to your `opencode.json` (or a project-local
 `opencode.json` / `.opencode.json`):
 
 ```json
