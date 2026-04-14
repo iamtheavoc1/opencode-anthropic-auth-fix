@@ -111,7 +111,7 @@ pkill -x opencode 2>/dev/null; opencode
 **Getting `Token refresh failed: 400 — {"error":"invalid_grant", ...}`.**
 That means OpenCode's stored refresh token is stale. The installer-patched plugin now tries to self-heal by borrowing a fresh bearer token from your local `claude` CLI login. If `claude` is still logged in, the next request should recover automatically.
 
-If you instead see `invalid authentication credentials`, that usually means the cached OpenCode access token is no longer accepted even though its stored expiry timestamp hasn't elapsed yet. The installer-patched plugin now detects that live request failure, re-syncs a fresh bearer token from your local `claude` CLI session, writes it back to OpenCode's auth cache, and retries the request automatically.
+If you instead see `invalid authentication credentials`, that usually means the cached OpenCode access token is no longer accepted even though its stored expiry timestamp hasn't elapsed yet. The installer-patched plugin now force-refreshes the OAuth token immediately on that live request failure, writes the rotated token back into OpenCode's auth cache, and retries automatically. If the refresh token itself is stale, it falls back to re-syncing from your local `claude` CLI session.
 
 If it still fails, either `claude` itself is logged out or both auth stores are stale. Re-auth once and you're back:
 
@@ -141,7 +141,7 @@ The plugin reuses the OAuth token OpenCode already has at `~/.local/share/openco
 4. Retries twice on network errors (500ms, then 1s backoff).
 5. Writes the rotated/recovered tokens back to `auth.json`.
 
-Under normal use the refresh cycle runs forever and you never notice. If the OpenCode refresh token dies but `claude login` is still valid, the plugin now recovers automatically. If both are stale, you need to log back into Claude CLI once.
+Under normal use the refresh cycle runs forever and you never notice. If the cached access token goes bad early, the plugin now force-refreshes it automatically. If the OpenCode refresh token dies but `claude login` is still valid, the plugin falls back to Claude CLI and recovers automatically. If both are stale, you need to log back into Claude CLI once.
 
 ## Credits
 
