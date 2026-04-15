@@ -20,6 +20,9 @@
 #      - adds the ex-machina plugin via file:// reference
 #      - sets default model to anthropic/claude-sonnet-4-6 if none is set
 #   6. Backs up your opencode.json before modifying
+#   7. Installs a proactive token refresh daemon (LaunchAgent on macOS,
+#      cron on Linux) that refreshes tokens every 2 hours so the OAuth
+#      chain never breaks — you never need 'claude login' again
 #
 # Why this is needed — the actual root cause:
 #
@@ -83,6 +86,15 @@ note "binary: $CLAUDE_BIN"
 NPM_BIN=$(resolve_tool npm /opt/homebrew/bin/npm /usr/local/bin/npm) \
   || fail "npm not found — required to download the plugin from the npm registry"
 ok "npm — $("$NPM_BIN" --version)"
+
+NODE_BIN=$(resolve_tool node /opt/homebrew/bin/node /usr/local/bin/node) \
+  || true
+if [ -n "${NODE_BIN:-}" ]; then
+  ok "node — $("$NODE_BIN" --version 2>/dev/null)"
+else
+  warn "node not found — proactive token refresh won't be installed"
+  note "Plugin still works but tokens won't auto-refresh while idle"
+fi
 
 OPENCODE_BIN=$(resolve_tool opencode "$HOME/.opencode/bin/opencode" /opt/homebrew/bin/opencode /usr/local/bin/opencode) \
   || warn "opencode binary not found on PATH — installer will still work, but you'll need to install OpenCode before it takes effect"
@@ -340,6 +352,170 @@ PY
 
 ok "plugin registered, legacy entries removed"
 
+# ─── Install proactive token refresh ─────────────────────────────────────────
+if [ -n "${NODE_BIN:-}" ]; then
+step "Installing proactive token refresh daemon"
+
+cat > "$REPO_ENTRY_DIR/refresh-token.mjs" <<'REFRESH_JS'
+#!/usr/bin/env node
+import { spawn } from 'node:child_process';
+import { existsSync, readFileSync, writeFileSync, appendFileSync, statSync } from 'node:fs';
+import { createServer } from 'node:http';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const HOME = homedir();
+const PLUGIN_DIR = process.env.OPENCODE_ANTHROPIC_AUTH_DIR || join(HOME, '.local/share/opencode-anthropic-auth');
+const AUTH_PATH = process.env.OPENCODE_AUTH_PATH || join(HOME, '.local/share/opencode/auth.json');
+const LOG_PATH = join(PLUGIN_DIR, 'refresh.log');
+const SYNC_MODEL = process.env.OPENCODE_ANTHROPIC_AUTH_CLAUDE_SYNC_MODEL || 'claude-sonnet-4-6';
+const TIMEOUT_MS = 30000;
+const TTL_MS = 14400000;
+const REFRESH_THRESHOLD_MS = 7200000;
+
+function log(msg) {
+    const line = `[${new Date().toISOString()}] ${msg}\n`;
+    try { appendFileSync(LOG_PATH, line); } catch {}
+    process.stderr.write(line);
+}
+
+async function tryOAuthRefresh(refreshToken) {
+    let CLIENT_ID, TOKEN_URL;
+    try {
+        const mod = await import(pathToFileURL(join(PLUGIN_DIR, 'dist/constants.js')).href);
+        CLIENT_ID = mod.CLIENT_ID;
+        TOKEN_URL = mod.TOKEN_URL;
+    } catch { return null; }
+    const res = await fetch(TOKEN_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/plain, */*', 'User-Agent': 'axios/1.13.6' },
+        body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: refreshToken, client_id: CLIENT_ID }),
+    });
+    if (!res.ok) { const body = await res.text().catch(() => ''); throw new Error(`${res.status}: ${body.slice(0, 200)}`); }
+    const json = await res.json();
+    return { access: json.access_token, refresh: json.refresh_token, expires: Date.now() + json.expires_in * 1000 };
+}
+
+function resolveClaudeBin() {
+    for (const c of [process.env.CLAUDE_BIN, join(HOME, '.local/bin/claude'), join(HOME, '.claude/local/claude'), '/opt/homebrew/bin/claude', '/usr/local/bin/claude', 'claude'].filter(Boolean))
+        if (c === 'claude' || existsSync(c)) return c;
+    return 'claude';
+}
+
+function captureBearer() {
+    return new Promise((resolve, reject) => {
+        let child = null, settled = false, timeout = null;
+        const finish = (fn, val) => { if (settled) return; settled = true; if (timeout) clearTimeout(timeout); server.close(); if (child?.exitCode === null) child.kill('SIGTERM'); fn(val); };
+        const server = createServer((req, res) => {
+            if (req.method === 'HEAD') { res.writeHead(200); res.end(); return; }
+            if (req.method === 'POST' && req.url?.startsWith('/v1/messages')) {
+                const auth = req.headers.authorization; res.writeHead(204); res.end();
+                if (typeof auth === 'string' && auth.startsWith('Bearer ')) finish(resolve, auth.slice(7));
+                else finish(reject, new Error('No bearer in captured request'));
+                return;
+            }
+            res.writeHead(404); res.end();
+        });
+        server.on('error', e => finish(reject, e));
+        server.listen(0, '127.0.0.1', () => {
+            const addr = server.address();
+            if (!addr || typeof addr === 'string') { finish(reject, new Error('Bind failed')); return; }
+            child = spawn(resolveClaudeBin(), ['--print', 'AUTH_REFRESH_OK', '--model', SYNC_MODEL], {
+                cwd: HOME, env: { ...process.env, ANTHROPIC_BASE_URL: `http://127.0.0.1:${addr.port}` }, stdio: ['ignore', 'ignore', 'pipe'],
+            });
+            let stderr = '';
+            child.stderr.on('data', chunk => { stderr += chunk; });
+            child.on('error', e => finish(reject, e));
+            child.on('exit', code => { if (!settled) finish(reject, new Error(`claude exited (${code})${stderr ? ' — ' + stderr.slice(0, 200) : ''}`)); });
+        });
+        timeout = setTimeout(() => finish(reject, new Error('Timeout')), TIMEOUT_MS);
+    });
+}
+
+async function main() {
+    try { if (existsSync(LOG_PATH) && statSync(LOG_PATH).size > 102400) { const l = readFileSync(LOG_PATH, 'utf8').split('\n'); writeFileSync(LOG_PATH, l.slice(-50).join('\n')); } } catch {}
+    if (!existsSync(AUTH_PATH)) { log('SKIP: no auth.json'); return; }
+    let store;
+    try { store = JSON.parse(readFileSync(AUTH_PATH, 'utf8')); } catch (e) { log(`ERROR: ${e.message}`); process.exit(1); }
+    const entry = store.anthropic;
+    if (!entry || entry.type !== 'oauth') { log('SKIP: no anthropic oauth entry'); return; }
+    const remaining = (entry.expires || 0) - Date.now();
+    if (remaining > REFRESH_THRESHOLD_MS) { log(`SKIP: ${(remaining / 3600000).toFixed(1)}h remaining`); return; }
+    log(remaining > 0 ? `${(remaining / 60000).toFixed(0)}min remaining — refreshing` : 'Expired — refreshing');
+    if (entry.refresh) {
+        try {
+            const result = await tryOAuthRefresh(entry.refresh);
+            if (result) { store.anthropic = { ...entry, ...result }; writeFileSync(AUTH_PATH, JSON.stringify(store, null, 2) + '\n'); log(`OK (oauth): expires in ${((result.expires - Date.now()) / 3600000).toFixed(1)}h`); return; }
+        } catch (e) { log(`OAuth failed (${e.message}), trying CLI capture`); }
+    }
+    try {
+        const access = await captureBearer();
+        store.anthropic = { ...entry, access, expires: Date.now() + TTL_MS };
+        writeFileSync(AUTH_PATH, JSON.stringify(store, null, 2) + '\n');
+        log(`OK (cli): expires in ${(TTL_MS / 3600000).toFixed(0)}h`);
+    } catch (e) { log(`FAIL: ${e.message}`); process.exit(1); }
+}
+main();
+REFRESH_JS
+
+chmod +x "$REPO_ENTRY_DIR/refresh-token.mjs"
+ok "refresh script: $REPO_ENTRY_DIR/refresh-token.mjs"
+
+if [ "$(uname)" = "Darwin" ]; then
+  PLIST_LABEL="com.opencode-anthropic-auth.refresh"
+  PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
+
+  launchctl bootout "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null || true
+
+  mkdir -p "$HOME/Library/LaunchAgents"
+  cat > "$PLIST_PATH" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${PLIST_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${NODE_BIN}</string>
+        <string>${REPO_ENTRY_DIR}/refresh-token.mjs</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>7200</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${REPO_ENTRY_DIR}/refresh.log</string>
+    <key>StandardErrorPath</key>
+    <string>${REPO_ENTRY_DIR}/refresh.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin</string>
+    </dict>
+</dict>
+</plist>
+PLIST
+
+  launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null \
+    || launchctl load "$PLIST_PATH" 2>/dev/null \
+    || warn "could not load LaunchAgent — run: launchctl load $PLIST_PATH"
+  ok "LaunchAgent: $PLIST_PATH (every 2h)"
+  note "Log: $REPO_ENTRY_DIR/refresh.log"
+else
+  CRON_CMD="0 */2 * * * ${NODE_BIN} ${REPO_ENTRY_DIR}/refresh-token.mjs >> ${REPO_ENTRY_DIR}/refresh.log 2>&1"
+  ( crontab -l 2>/dev/null | grep -v "refresh-token.mjs"; echo "$CRON_CMD" ) | crontab - 2>/dev/null \
+    || warn "could not install cron — add manually: $CRON_CMD"
+  ok "cron: refreshes every 2 hours"
+  note "Log: $REPO_ENTRY_DIR/refresh.log"
+fi
+
+else
+  warn "Skipping proactive refresh daemon (node not found)"
+  note "Plugin still works reactively — but idle tokens may expire"
+fi
+
 # ─── Done ────────────────────────────────────────────────────────────────────
 step "Done"
 
@@ -347,17 +523,18 @@ cat <<EOF
 
   Plugin:  $REPO_ENTRY_DIR
   Config:  $CONFIG_PATH
+  Daemon:  refreshes tokens every 2h (check $REPO_ENTRY_DIR/refresh.log)
 
-  Now restart OpenCode so it picks up the new plugin:
+  Restart OpenCode to pick up the new plugin:
 
     pkill -x opencode 2>/dev/null
     opencode
 
-  Test with any Anthropic model:
+  Test:
 
     opencode run "say hi" --model anthropic/claude-sonnet-4-6
 
-  Re-run this installer any time to update the plugin to the latest version
-  on npm or to re-apply the config after something clobbers it.
+  Re-run this installer any time to update or re-apply.
+  You should never need 'claude login' again.
 
 EOF

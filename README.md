@@ -10,7 +10,7 @@ curl -fsSL https://raw.githubusercontent.com/iamtheavoc1/opencode-anthropic-auth
 
 Re-runnable, idempotent, backs up `~/.config/opencode/opencode.json` before touching it. Works with the OAuth session your `claude login` already set up — no `setup-token`, no API key, no new auth flow.
 
-You do **not** need to fetch a token manually. Run `claude login` once, run the one-line installer, and OpenCode will reuse that session. It refreshes its own token automatically, and if OpenCode's stored refresh token goes stale while Claude CLI is still logged in, the patched plugin re-syncs from Claude CLI locally.
+Run `claude login` once, run the one-line installer, and **you never need to touch auth again**. The installer sets up a background daemon (LaunchAgent on macOS, cron on Linux) that proactively refreshes your OAuth tokens every 2 hours via Anthropic's token endpoint. Each refresh rotates both access and refresh tokens, so the chain stays alive indefinitely. If OAuth refresh ever fails, the daemon falls back to capturing a fresh bearer from your local Claude CLI session.
 
 After it runs, restart OpenCode and you're done:
 
@@ -76,16 +76,24 @@ So OpenCode keeps building its multi-block system prompts the normal way, the pl
    - strip `claude-proxy` and `claude-code` provider entries (both superseded)
    - set the default model to `anthropic/claude-sonnet-4-6` if none is set, or if the existing default pointed at one of the removed providers
 
+7. Installs a proactive token refresh daemon:
+   - macOS: LaunchAgent at `~/Library/LaunchAgents/com.opencode-anthropic-auth.refresh.plist`
+   - Linux: cron job (`0 */2 * * *`)
+   - Runs every 2 hours, refreshes via OAuth when the token has < 2 hours remaining
+   - Each refresh rotates both access and refresh tokens — the chain is self-sustaining
+   - Falls back to Claude CLI loopback capture if OAuth refresh fails
+   - Logs to `~/.local/share/opencode-anthropic-auth/refresh.log`
+
 Existing keys, other plugins, and other providers are preserved. The rewrite is JSON-safe (done in Python, not sed).
 
 ## Requirements
 
 | Tool | Why | Install |
 | --- | --- | --- |
-| [**Claude CLI**](https://docs.claude.com/en/docs/claude-code/overview) | Provides the OAuth session the plugin reuses. | Follow the docs, then `claude login`. |
+| [**Claude CLI**](https://docs.claude.com/en/docs/claude-code/overview) | One-time bootstrap — provides the initial OAuth session. | Follow the docs, then `claude login`. |
 | **Claude Pro or Max subscription** | Without one there's nothing to bill against. | [claude.ai/upgrade](https://claude.ai/upgrade) |
 | [**OpenCode**](https://opencode.ai) | The thing we're patching. | Follow the install instructions at opencode.ai. |
-| **npm** | Downloads the plugin from the npm registry. Ships with Node.js. | [nodejs.org](https://nodejs.org/) |
+| **Node.js** | Runs the refresh daemon. Also provides npm. | [nodejs.org](https://nodejs.org/) |
 | **python3** | Rewrites `opencode.json` safely. | Preinstalled on macOS and most Linux distros. |
 | **git** | Used by the installer's sanity checks. | Xcode Command Line Tools / your package manager. |
 
@@ -113,7 +121,13 @@ That means OpenCode's stored refresh token is stale. The installer-patched plugi
 
 If you instead see `invalid authentication credentials`, that usually means the cached OpenCode access token is no longer accepted even though its stored expiry timestamp hasn't elapsed yet. The installer-patched plugin now force-refreshes the OAuth token immediately on that live request failure, writes the rotated token back into OpenCode's auth cache, and retries automatically. If the refresh token itself is stale, it falls back to re-syncing from your local `claude` CLI session.
 
-If it still fails, either `claude` itself is logged out or both auth stores are stale. Re-auth once and you're back:
+With the background refresh daemon installed, this should be rare. The daemon refreshes tokens every 2 hours and the plugin retries on failures. Check the daemon log if things seem off:
+
+```bash
+cat ~/.local/share/opencode-anthropic-auth/refresh.log
+```
+
+If the daemon log shows `FAIL` entries, the refresh token itself may have expired (e.g. machine was off for days). One `claude login` resets the chain:
 
 ```bash
 claude login
@@ -125,6 +139,9 @@ If OpenCode keeps holding onto a bad auth record after that, clear just the Anth
 python3 -c 'import json,os; p=os.path.expanduser("~/.local/share/opencode/auth.json"); a=json.load(open(p)); a.pop("anthropic", None); json.dump(a, open(p, "w"), indent=2)'
 ```
 
+**Daemon not running?**
+Check with `launchctl list | grep opencode-anthropic-auth`. If missing, re-run the installer.
+
 **Running the installer overwrote my default model.**
 It only replaces the default if it was unset or pointed at a removed provider (`claude-code/*` or `claude-proxy/*`). Your backup is at `~/.config/opencode/opencode.json.bak.<timestamp>` — copy the `"model"` field back if you need to.
 
@@ -133,15 +150,23 @@ Re-run the same curl command. It's idempotent and picks up the latest version on
 
 ## Token lifecycle
 
-The plugin reuses the OAuth token OpenCode already has at `~/.local/share/opencode/auth.json`. On every `/v1/messages` call it:
+Two layers keep your tokens alive:
 
-1. Checks the `expires` timestamp.
-2. If within ~1 minute of expiry, POSTs to `https://platform.claude.com/v1/oauth/token` with `grant_type=refresh_token` and swaps in a fresh access+refresh pair atomically.
-3. If that refresh fails with `invalid_grant` but your local Claude CLI login is still alive, it spins up a loopback capture, asks `claude` for a local request, grabs the current bearer token, and writes that back into OpenCode's auth cache.
-4. Retries twice on network errors (500ms, then 1s backoff).
-5. Writes the rotated/recovered tokens back to `auth.json`.
+**Background daemon** (proactive — runs every 2 hours):
 
-Under normal use the refresh cycle runs forever and you never notice. If the cached access token goes bad early, the plugin now force-refreshes it automatically. If the OpenCode refresh token dies but `claude login` is still valid, the plugin falls back to Claude CLI and recovers automatically. If both are stale, you need to log back into Claude CLI once.
+1. Checks the `expires` timestamp in `~/.local/share/opencode/auth.json`.
+2. If < 2 hours remaining, POSTs to `https://platform.claude.com/v1/oauth/token` with `grant_type=refresh_token`.
+3. Writes the fresh access token, refresh token, and expiry back to `auth.json`.
+4. If OAuth refresh fails, falls back to capturing a fresh bearer from Claude CLI via loopback proxy.
+5. Logs every action to `~/.local/share/opencode-anthropic-auth/refresh.log`.
+
+**Plugin** (reactive — runs on every API call):
+
+1. Checks the `expires` timestamp before each `/v1/messages` call.
+2. If within ~1 minute of expiry, refreshes via OAuth or Claude CLI fallback (same logic as the daemon).
+3. If a request returns 401/403/`invalid authentication credentials`, force-refreshes and retries once.
+
+Under normal use the daemon handles everything in the background and you never notice. The plugin's reactive refresh is a safety net in case the daemon misses a cycle. Together they keep the token chain alive indefinitely — you run `claude login` once during setup and never again.
 
 ## Credits
 
