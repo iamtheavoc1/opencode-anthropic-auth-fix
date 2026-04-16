@@ -50,6 +50,23 @@ CONFIG_PATH="${OPENCODE_CONFIG:-$HOME/.config/opencode/opencode.json}"
 PLUGIN_REF="file://$REPO_ENTRY_DIR/dist/index.js"
 NPM_PKG="@ex-machina/opencode-anthropic-auth"
 
+# ─── Mode detection ──────────────────────────────────────────────────────────
+# VPS-offload mode: if $REPO_ENTRY_DIR/.vps-config exists (from install-vps-daemon.sh),
+# the installer skips the local refresh daemon (no LaunchAgent/cron/caffeinate)
+# and instead installs pull-from-vps.sh so the Mac pulls fresh tokens on demand
+# from a Tailscale-networked VPS that handles refresh.
+#
+# Override: OCAUTH_FORCE_MAC_MODE=1 forces the legacy Mac-only path even when
+# .vps-config is present (useful for testing or temporary rollback).
+VPS_CONFIG="$REPO_ENTRY_DIR/.vps-config"
+if [ -n "${OCAUTH_VPS_HOST:-}" ] && [ "${OCAUTH_FORCE_MAC_MODE:-}" != "1" ]; then
+  MODE="vps-offload"
+elif [ -f "$VPS_CONFIG" ] && [ "${OCAUTH_FORCE_MAC_MODE:-}" != "1" ]; then
+  MODE="vps-offload"
+else
+  MODE="mac-only"
+fi
+
 c_green()  { printf '\033[32m%s\033[0m' "$1"; }
 c_red()    { printf '\033[31m%s\033[0m' "$1"; }
 c_yellow() { printf '\033[33m%s\033[0m' "$1"; }
@@ -574,7 +591,24 @@ chmod +x "$REPO_ENTRY_DIR/recover.sh"
 ok "recovery helper: $REPO_ENTRY_DIR/recover.sh"
 note "if auth dies, run: $REPO_ENTRY_DIR/recover.sh"
 
-if [ "$(uname)" = "Darwin" ]; then
+if [ "$MODE" = "vps-offload" ]; then
+  step "Skipping local refresh daemon (VPS-offload mode)"
+  note "VPS handles token refresh on a 30-minute systemd timer."
+  note "Mac pulls fresh tokens on demand via pull-from-vps.sh (installed below)."
+  note "If a legacy LaunchAgent is loaded from a prior Mac-only install, unloading it."
+
+  if [ "$(uname)" = "Darwin" ]; then
+    PLIST_LABEL="com.opencode-anthropic-auth.refresh"
+    PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
+    launchctl bootout "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null || true
+    if [ -f "$PLIST_PATH" ]; then
+      mv "$PLIST_PATH" "$PLIST_PATH.disabled-$(date +%s)" 2>/dev/null || true
+      note "disabled legacy plist: $PLIST_PATH.disabled-*"
+    fi
+  else
+    (crontab -l 2>/dev/null | grep -v "refresh-token.mjs" || true) | crontab - 2>/dev/null || true
+  fi
+elif [ "$(uname)" = "Darwin" ]; then
   PLIST_LABEL="com.opencode-anthropic-auth.refresh"
   PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
 
@@ -641,6 +675,121 @@ else
   note "Plugin still works reactively — but idle tokens may expire"
 fi
 
+if [ "$MODE" = "vps-offload" ]; then
+step "Installing VPS-offload pull helper"
+
+if [ -n "${OCAUTH_VPS_HOST:-}" ]; then
+  : "${OCAUTH_TS_IP:?OCAUTH_TS_IP is required in VPS-offload mode}"
+  : "${OCAUTH_BEARER:?OCAUTH_BEARER is required in VPS-offload mode}"
+  OCAUTH_PORT="${OCAUTH_PORT:-8787}"
+  cat > "$VPS_CONFIG" <<EOF
+OCAUTH_HOST=${OCAUTH_VPS_HOST}
+OCAUTH_TS_IP=${OCAUTH_TS_IP}
+OCAUTH_PORT=${OCAUTH_PORT}
+OCAUTH_BEARER=${OCAUTH_BEARER}
+EOF
+  chmod 600 "$VPS_CONFIG"
+  ok "VPS config: $VPS_CONFIG"
+fi
+
+cat > "$REPO_ENTRY_DIR/pull-from-vps.sh" <<'PULL_SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+PLUGIN_DIR="${OPENCODE_ANTHROPIC_AUTH_DIR:-$HOME/.local/share/opencode-anthropic-auth}"
+CONFIG_FILE="$PLUGIN_DIR/.vps-config"
+AUTH_PATH="${OPENCODE_AUTH_PATH:-$HOME/.local/share/opencode/auth.json}"
+LOG_PATH="$PLUGIN_DIR/refresh.log"
+
+log() {
+  local msg="$1"
+  printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$msg" >> "$LOG_PATH"
+}
+
+fail() {
+  local code="$1"; shift
+  log "FAIL[$code]: $*"
+  exit "$code"
+}
+
+[[ -f "$CONFIG_FILE" ]] || fail 1 "missing $CONFIG_FILE"
+[[ -f "$AUTH_PATH" ]] || fail 3 "missing $AUTH_PATH"
+command -v curl >/dev/null 2>&1 || fail 3 "curl not found"
+command -v jq >/dev/null 2>&1 || fail 3 "jq not found"
+
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
+
+: "${OCAUTH_HOST:?missing OCAUTH_HOST}"
+: "${OCAUTH_TS_IP:?missing OCAUTH_TS_IP}"
+: "${OCAUTH_PORT:?missing OCAUTH_PORT}"
+: "${OCAUTH_BEARER:?missing OCAUTH_BEARER}"
+
+TMP_RESP="$(mktemp -t ocauth.resp.XXXXXX)"
+TMP_OUT="$(mktemp -t ocauth.auth.XXXXXX)"
+cleanup() {
+  rm -f "$TMP_RESP" "$TMP_OUT"
+}
+trap cleanup EXIT
+
+fetch_url() {
+  local url="$1"
+  curl --max-time 5 --connect-timeout 3 -sSf \
+    -H "Authorization: Bearer ${OCAUTH_BEARER}" \
+    "$url" > "$TMP_RESP"
+}
+
+SOURCE_LABEL="fqdn"
+if ! fetch_url "http://${OCAUTH_HOST}:${OCAUTH_PORT}/token"; then
+  SOURCE_LABEL="ip"
+  if ! fetch_url "http://${OCAUTH_TS_IP}:${OCAUTH_PORT}/token"; then
+    fail 1 "network/auth fetch failed via fqdn and ip"
+  fi
+fi
+
+NOW_MS="$(( $(date +%s) * 1000 ))"
+if ! jq -e --argjson now "$NOW_MS" '
+  .type == "oauth" and
+  (.access | type == "string" and length > 0) and
+  (.refresh | type == "string" and length > 0) and
+  (.expires | type == "number" and . > $now)
+' "$TMP_RESP" >/dev/null; then
+  fail 2 "invalid token payload from VPS"
+fi
+
+if ! jq --slurpfile new "$TMP_RESP" '.anthropic = $new[0]' "$AUTH_PATH" > "$TMP_OUT"; then
+  fail 3 "failed to merge auth.json"
+fi
+
+mv -f "$TMP_OUT" "$AUTH_PATH"
+chmod 600 "$AUTH_PATH"
+
+EXPIRES_MS="$(jq -r '.expires' "$TMP_RESP")"
+REMAINING_H="$(python3 - <<PY
+now=${NOW_MS}
+exp=${EXPIRES_MS}
+print(round((exp-now)/3600000, 2))
+PY
+)"
+log "pull-from-vps OK source=${SOURCE_LABEL} expires_in_h=${REMAINING_H}"
+exit 0
+PULL_SH
+
+chmod +x "$REPO_ENTRY_DIR/pull-from-vps.sh"
+ok "pull helper: $REPO_ENTRY_DIR/pull-from-vps.sh"
+note "Wrapper will call this on-demand when <10min remaining or on 401."
+
+JQ_BIN=$(resolve_tool jq /opt/homebrew/bin/jq /usr/local/bin/jq /usr/bin/jq) || true
+if [ -z "${JQ_BIN:-}" ]; then
+  warn "jq not found on PATH — pull-from-vps.sh requires it"
+  if [ "$(uname)" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
+    note "Install with: brew install jq"
+  else
+    note "Install with your package manager (apt/dnf/pacman): jq"
+  fi
+fi
+fi
+
 # ─── Install Claude CLI wrapper ─────────────────────────────────────────────
 step "Installing Claude CLI auth wrapper"
 
@@ -672,36 +821,83 @@ with open(p, 'w') as f: f.write(s)
 # >>> opencode-anthropic-auth-wrapper >>>
 # Auto-generated by opencode-anthropic-auth installer. Do not edit manually.
 claude() {
-    local __oaa_token __oaa_rc __oaa_stderr
-    __oaa_token=$(python3 -c "
+    local __oaa_access __oaa_refresh __oaa_expires __oaa_now_ms __oaa_remaining
+    local __oaa_rc __oaa_stderr
+    local __oaa_vps_mode=0
+    local __oaa_pull="$HOME/.local/share/opencode-anthropic-auth/pull-from-vps.sh"
+    local __oaa_vps_cfg="$HOME/.local/share/opencode-anthropic-auth/.vps-config"
+    local __oaa_scopes="user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload org:create_api_key"
+
+    __oaa_read_auth() {
+        python3 -c "
 import json, os, sys
 try:
     p = os.path.expanduser('~/.local/share/opencode/auth.json')
-    a = json.load(open(p))
-    t = a.get('anthropic', {}).get('access', '')
-    if t:
-        print(t, end='')
-    else:
-        sys.exit(1)
-except:
-    sys.exit(1)
-" 2>/dev/null)
+    a = json.load(open(p)).get('anthropic', {})
+    print(a.get('access', ''))
+    print(a.get('refresh', ''))
+    print(a.get('expires', 0))
+except Exception:
+    print('')
+    print('')
+    print(0)
+" 2>/dev/null
+    }
+
+    local __oaa_auth
+    [ -f "$__oaa_vps_cfg" ] && __oaa_vps_mode=1
+
+    if [ $__oaa_vps_mode -eq 1 ] && [ -x "$__oaa_pull" ]; then
+        "$__oaa_pull" >/dev/null 2>&1 || true
+    fi
+
+    __oaa_auth=$(__oaa_read_auth)
+    __oaa_access=$(printf '%s\n' "$__oaa_auth" | sed -n '1p')
+    __oaa_refresh=$(printf '%s\n' "$__oaa_auth" | sed -n '2p')
+    __oaa_expires=$(printf '%s\n' "$__oaa_auth" | sed -n '3p')
+    __oaa_now_ms=$(( $(date +%s) * 1000 ))
+    __oaa_remaining=$(( ${__oaa_expires:-0} - __oaa_now_ms ))
+
+    if [ $__oaa_vps_mode -eq 0 ] && [ "$__oaa_remaining" -lt 600000 ] && [ -x "$__oaa_pull" ]; then
+        "$__oaa_pull" >/dev/null 2>&1 || true
+        __oaa_auth=$(__oaa_read_auth)
+        __oaa_access=$(printf '%s\n' "$__oaa_auth" | sed -n '1p')
+        __oaa_refresh=$(printf '%s\n' "$__oaa_auth" | sed -n '2p')
+    fi
 
     __oaa_stderr=$(mktemp -t oaa.stderr.XXXXXX)
-    if [ -n "$__oaa_token" ]; then
-        CLAUDE_CODE_OAUTH_TOKEN="$__oaa_token" command claude "$@" 2> >(tee "$__oaa_stderr" >&2)
+    if [ -n "$__oaa_access" ] && [ -n "$__oaa_refresh" ]; then
+        CLAUDE_CODE_OAUTH_TOKEN="$__oaa_access" \
+        CLAUDE_CODE_OAUTH_REFRESH_TOKEN="$__oaa_refresh" \
+        CLAUDE_CODE_OAUTH_SCOPES="$__oaa_scopes" \
+        command claude "$@" 2> >(tee "$__oaa_stderr" >&2)
     else
         command claude "$@" 2> >(tee "$__oaa_stderr" >&2)
     fi
     __oaa_rc=$?
 
-    if [ $__oaa_rc -ne 0 ] && grep -qE "(401|OAuth token|authentication_error|invalid_grant|refresh_token)" "$__oaa_stderr" 2>/dev/null; then
-        echo >&2
-        echo "┌──────────────────────────────────────────────────────┐" >&2
-        echo "│  opencode-anthropic-auth: token appears dead         │" >&2
-        echo "│  Recover with:                                       │" >&2
-        echo "│    ~/.local/share/opencode-anthropic-auth/recover.sh │" >&2
-        echo "└──────────────────────────────────────────────────────┘" >&2
+    if [ $__oaa_rc -ne 0 ] && grep -qE "(401|OAuth token|authentication_error|invalid_grant|refresh_token|invalid authentication credentials)" "$__oaa_stderr" 2>/dev/null; then
+        if [ -x "$__oaa_pull" ]; then
+            "$__oaa_pull" >/dev/null 2>&1 || true
+            __oaa_auth=$(__oaa_read_auth)
+            __oaa_access=$(printf '%s\n' "$__oaa_auth" | sed -n '1p')
+            __oaa_refresh=$(printf '%s\n' "$__oaa_auth" | sed -n '2p')
+            if [ -n "$__oaa_access" ] && [ -n "$__oaa_refresh" ]; then
+                CLAUDE_CODE_OAUTH_TOKEN="$__oaa_access" \
+                CLAUDE_CODE_OAUTH_REFRESH_TOKEN="$__oaa_refresh" \
+                CLAUDE_CODE_OAUTH_SCOPES="$__oaa_scopes" \
+                command claude "$@" 2> >(tee "$__oaa_stderr" >&2)
+                __oaa_rc=$?
+            fi
+        fi
+        if [ $__oaa_rc -ne 0 ]; then
+            echo >&2
+            echo "┌──────────────────────────────────────────────────────┐" >&2
+            echo "│  opencode-anthropic-auth: token appears dead         │" >&2
+            echo "│  Recover with:                                       │" >&2
+            echo "│    ~/.local/share/opencode-anthropic-auth/recover.sh │" >&2
+            echo "└──────────────────────────────────────────────────────┘" >&2
+        fi
     fi
     rm -f "$__oaa_stderr"
     return $__oaa_rc
@@ -724,7 +920,16 @@ cat <<EOF
 
   Plugin:  $REPO_ENTRY_DIR
   Config:  $CONFIG_PATH
+  Mode:    $MODE
+
+$(if [ "$MODE" = "vps-offload" ]; then cat <<MODE_EOF
+  VPS:     canonical refresh runs on your Tailscale VPS
+  Pull:    on-demand via $REPO_ENTRY_DIR/pull-from-vps.sh
+MODE_EOF
+else cat <<MODE_EOF
   Daemon:  refreshes tokens every 45min (check $REPO_ENTRY_DIR/refresh.log)
+MODE_EOF
+fi)
 
   Restart OpenCode to pick up the new plugin:
 
