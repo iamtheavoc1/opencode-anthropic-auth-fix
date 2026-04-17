@@ -363,6 +363,41 @@ export CLAUDE_CODE_OAUTH_SCOPES='user:profile user:inference user:sessions:claud
 
 The wrapper is injected with idempotent marker comments — re-running the installer updates it in-place without duplicating it.
 
+## Scripts reference
+
+This repo ships three installers/helpers and installs four more scripts into your home directory. Each one has one job. Here is the full map.
+
+### Shipped in this repo
+
+| Script | Location in repo | Run when | What it does |
+| --- | --- | --- | --- |
+| `fix-opencode.sh` | repo root | Once on each Mac (client) | Installs the `@ex-machina/opencode-anthropic-auth` plugin, patches it for self-healing refresh, rewrites `opencode.json`, installs a Mac-only refresh daemon (or the VPS pull helper in VPS-offload mode), installs the `claude()` shell wrapper, and drops `sync-claude-to-opencode.sh` into `~/.local/bin`. Idempotent — re-run to update. |
+| `install-vps-daemon.sh <ssh-host>` | repo root | Once per VPS | Bootstraps a Linux VPS as the canonical token refresher. Installs `age`/`jq`/`node`/`tailscale`, creates the `ocauth` service account, deploys systemd `ocauth-refresh.service` + `ocauth-refresh.timer` + `ocauth-server.service`, migrates your current local OAuth pair into `/opt/ocauth/token.age`, and writes `~/.local/share/opencode-anthropic-auth/.vps-config` on your Mac (including `OCAUTH_SSH_HOST` for the SSH fallback). |
+| `scripts/sync-claude-to-opencode.sh` | repo `scripts/` | On demand on your Mac | Reads the **fresh** Claude CLI OAuth pair from the macOS Keychain (`Claude Code-credentials`) and mirrors it into `~/.local/share/opencode/auth.json`. Before writing, it calls `api.anthropic.com/api/oauth/usage` to verify the token is actually accepted upstream (expiry timestamps alone are not enough — Anthropic can revoke a token while it still looks valid locally). If the local token is invalid, it auto-refreshes via `claude` CLI; if refresh fails, it tells you to run `claude auth login`. Also supports `--status` (human-readable state + usage meter) and `--version`. |
+
+### Installed into your home directory
+
+| Installed path | Source | Run when | What it does |
+| --- | --- | --- | --- |
+| `~/.local/share/opencode-anthropic-auth/dist/` | `npm pack @ex-machina/opencode-anthropic-auth`, patched | Loaded on every OpenCode request | The actual plugin. Rewrites `system[]` so Anthropic accepts OAuth-billed requests, and self-heals by force-refreshing on 401/403/`invalid authentication credentials`. |
+| `~/.local/share/opencode-anthropic-auth/pull-from-vps.sh` | emitted by `fix-opencode.sh` (VPS-offload mode only) | Automatically by the `claude()` wrapper, or manually | Pulls a fresh OAuth pair from the VPS and merges it into `auth.json`. Tries **fqdn → tailscale IP → SSH fallback** in that order, so it keeps working even when Tailscale is down as long as plain SSH to the VPS works. Reads `.vps-config` for `OCAUTH_HOST`, `OCAUTH_TS_IP`, `OCAUTH_PORT`, `OCAUTH_BEARER`, and `OCAUTH_SSH_HOST`. |
+| `~/.local/share/opencode-anthropic-auth/recover.sh` | shipped in the npm package | When the `claude()` wrapper prints a recovery banner | Opens the Anthropic login page, writes the new token into OpenCode's auth store, and re-establishes the paired token. |
+| `~/.local/share/opencode-anthropic-auth/reset.sh` | shipped in the npm package | Manual — last resort | Clears OpenCode's Anthropic auth entry so the plugin can rebuild it from scratch on the next request. |
+| `~/.local/share/opencode-anthropic-auth/.vps-config` | `install-vps-daemon.sh` | Read by `pull-from-vps.sh` | Tailscale host/IP, bearer token, and `OCAUTH_SSH_HOST`. Mode `600`. |
+| `~/.local/share/opencode-anthropic-auth/refresh.log` | daemons + helpers | Append-only | Single source of truth for "what did auth do and when". Inspect this before assuming anything. |
+| `~/.local/bin/sync-claude-to-opencode.sh` | copied by `fix-opencode.sh` | On demand | See `scripts/sync-claude-to-opencode.sh` above. |
+| `~/.local/bin/claude-sync` | symlink to the above | Convenience shortcut | `claude-sync` = run sync, `claude-sync --status` = show state. |
+| `claude()` shell function in `~/.zshrc` or `~/.bashrc` | injected by `fix-opencode.sh` | Every `claude …` invocation | Reads `auth.json`, exports **all three** `CLAUDE_CODE_OAUTH_*` env vars (token + refresh + scopes — all required), pulls from the VPS first in VPS-offload mode, and retries once on 401. Degrades gracefully to raw `claude` if `auth.json` is missing. |
+
+### When to reach for which
+
+- **Something is broken, I don't know what** → `cat ~/.local/share/opencode-anthropic-auth/refresh.log` first, then `claude-sync --status`.
+- **`opencode` says "out of extra usage"** → Plugin didn't load. `pkill -x opencode; opencode`. If it persists, re-run `fix-opencode.sh`.
+- **`claude` says `Invalid authentication credentials`** → Token is dead upstream even if local expiry looks fine. Run `claude auth login` once, then `claude-sync` to mirror the fresh creds into OpenCode.
+- **Mac was off/asleep for hours and nothing works** → In VPS-offload mode: `~/.local/share/opencode-anthropic-auth/pull-from-vps.sh`. In Mac-only mode: `~/.local/share/opencode-anthropic-auth/recover.sh`.
+- **I just want to see how much of my quota I've used** → `claude-sync --status`.
+- **Tailscale is off and I still want the VPS pull to work** → Make sure `OCAUTH_SSH_HOST` is set in `.vps-config` (the installer now does this). `pull-from-vps.sh` will try SSH after fqdn/IP both fail.
+
 ## Credits
 
 The actual fix — the `rewriteRequestBody` logic that relocates non-identity system blocks — is in [`@ex-machina/opencode-anthropic-auth`](https://www.npmjs.com/package/@ex-machina/opencode-anthropic-auth) by [ex-machina-co](https://github.com/ex-machina-co/opencode-anthropic-auth). Huge thanks to [@juliancoy](https://github.com/juliancoy) for figuring out the `system[]` validation and publishing the plugin. This repo is just a one-command installer that wires it into OpenCode's config correctly and rips out the broken legacy plugins.

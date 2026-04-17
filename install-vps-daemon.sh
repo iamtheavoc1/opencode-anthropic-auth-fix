@@ -470,9 +470,11 @@ OCAUTH_HOST=$OCAUTH_HOST
 OCAUTH_TS_IP=$TS_IP
 OCAUTH_PORT=$PORT
 OCAUTH_BEARER=$BEARER
+OCAUTH_SSH_HOST=$SSH_HOST
 EOF
 chmod 600 "$CONFIG_PATH"
 ok "wrote $CONFIG_PATH"
+note "OCAUTH_SSH_HOST=$SSH_HOST enables SSH fallback when Tailscale is unavailable"
 
 step "Validating token server"
 python3 - <<PY

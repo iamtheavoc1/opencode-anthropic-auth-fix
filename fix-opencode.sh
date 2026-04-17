@@ -725,6 +725,11 @@ source "$CONFIG_FILE"
 : "${OCAUTH_PORT:?missing OCAUTH_PORT}"
 : "${OCAUTH_BEARER:?missing OCAUTH_BEARER}"
 
+# Optional SSH fallback: when Tailscale is off/broken the Mac can still reach
+# the VPS over regular SSH and decrypt the token directly. Set OCAUTH_SSH_HOST
+# in .vps-config (e.g. the alias from ~/.ssh/config) to enable this path.
+SSH_FALLBACK_HOST="${OCAUTH_SSH_HOST:-}"
+
 TMP_RESP="$(mktemp -t ocauth.resp.XXXXXX)"
 TMP_OUT="$(mktemp -t ocauth.auth.XXXXXX)"
 cleanup() {
@@ -739,11 +744,22 @@ fetch_url() {
     "$url" > "$TMP_RESP"
 }
 
+fetch_via_ssh() {
+  local host="$1"
+  [[ -n "$host" ]] || return 1
+  command -v ssh >/dev/null 2>&1 || return 1
+  ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" \
+    'sudo age -d -i /opt/ocauth/key.txt /opt/ocauth/token.age' > "$TMP_RESP"
+}
+
 SOURCE_LABEL="fqdn"
 if ! fetch_url "http://${OCAUTH_HOST}:${OCAUTH_PORT}/token"; then
   SOURCE_LABEL="ip"
   if ! fetch_url "http://${OCAUTH_TS_IP}:${OCAUTH_PORT}/token"; then
-    fail 1 "network/auth fetch failed via fqdn and ip"
+    SOURCE_LABEL="ssh"
+    if ! fetch_via_ssh "$SSH_FALLBACK_HOST"; then
+      fail 1 "network/auth fetch failed via fqdn, ip, and ssh fallback"
+    fi
   fi
 fi
 
@@ -913,7 +929,39 @@ else
   note "Add the claude() function from README manually"
 fi
 
-# ─── Done ────────────────────────────────────────────────────────────────────
+step "Installing Keychain -> OpenCode sync helper"
+
+SYNC_SRC_URL="https://raw.githubusercontent.com/iamtheavoc1/opencode-anthropic-auth-fix/main/scripts/sync-claude-to-opencode.sh"
+SYNC_DEST_DIR="$HOME/.local/bin"
+SYNC_DEST="$SYNC_DEST_DIR/sync-claude-to-opencode.sh"
+SYNC_LINK="$SYNC_DEST_DIR/claude-sync"
+
+mkdir -p "$SYNC_DEST_DIR"
+
+SYNC_LOCAL_SRC="$(dirname "$0")/scripts/sync-claude-to-opencode.sh"
+if [ -f "$SYNC_LOCAL_SRC" ]; then
+  cp "$SYNC_LOCAL_SRC" "$SYNC_DEST"
+  ok "copied sync-claude-to-opencode.sh from local checkout"
+elif command -v curl >/dev/null 2>&1; then
+  if curl -fsSL "$SYNC_SRC_URL" -o "$SYNC_DEST.tmp" 2>/dev/null; then
+    mv "$SYNC_DEST.tmp" "$SYNC_DEST"
+    ok "downloaded sync-claude-to-opencode.sh"
+  else
+    rm -f "$SYNC_DEST.tmp"
+    warn "could not download sync script from $SYNC_SRC_URL"
+  fi
+else
+  warn "curl not available; skipping sync script install"
+fi
+
+if [ -f "$SYNC_DEST" ]; then
+  chmod +x "$SYNC_DEST"
+  ln -sf "$SYNC_DEST" "$SYNC_LINK"
+  ok "sync helper: $SYNC_DEST"
+  note "Run 'claude-sync' any time to mirror fresh Keychain creds into OpenCode"
+  note "Run 'claude-sync --status' to check upstream token validity"
+fi
+
 step "Done"
 
 cat <<EOF
